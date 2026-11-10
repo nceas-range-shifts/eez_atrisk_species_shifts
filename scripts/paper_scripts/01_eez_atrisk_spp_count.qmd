@@ -1,0 +1,220 @@
+---
+title: "New and lost species count in EEZs"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+    message: false
+    warning: false
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(janitor)
+library(sf)
+library(terra)
+library(arrow)
+library(collapse)
+```
+
+This document uses the IUCN lookup and threat category data created in the chi repository. It connects IUCN status to AquaX data using the Aphia ID, which is a unique identifier for marine species in the World Register of Marine Species (WoRMS). 
+The script then processes the AquaX data to identify the number of at-risk species entering and exiting Exclusive Economic Zones (EEZs) under different climate scenarios.
+
+```{r}
+iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data_raw/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+```
+
+```{r}
+iucn_new_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data_raw/iucn_redlist_2026/iucn_species_assessments.csv")
+```
+
+```{r}
+# Load functions for processing AquaX data
+source(here( "common_fxns.R"))
+```
+
+We'll use the functions to process the AquaX data for the count of threatened species entering and exiting EEZs.
+
+## EEZ 
+
+```{r}
+eez <- st_read('/home/shares/usgs-cap-rangeshifts/spatial/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg')
+```
+
+```{r}
+eez_simple <- eez %>% 
+  select(MRGID, GEONAME, geom)
+```
+
+```{r}
+# Create a blank raster matching AquaX resolution (EEZs should be large enough to just do 0.05 degree raster)
+eez_raster_blank <- rast(xmin = -180,
+                  xmax = 180,
+                  ymin = -90, 
+                  ymax = 90,
+                  resolution = 0.05,
+                  crs = "EPSG:4326")
+```
+
+```{r}
+eez_raster_geoname <- rasterize(eez_simple, eez_raster_blank, field = "GEONAME")
+```
+
+```{r}
+eez_raster_mrgid <- rasterize(eez_simple, eez_raster_blank, field = "MRGID")
+```
+
+```{r}
+# Get GEONAMES of non-contested regions
+eez_200nm <-eez %>% 
+  filter(POL_TYPE == "200NM")
+
+eez_200nm_list <- eez_200nm$GEONAME
+```
+
+
+# IUCN threatened species
+
+```{r}
+# Filter the iucn_lookup for species with an SDM
+iucn_lookup_sdm <- iucn_lookup %>% filter(aquax == "SDM")
+```
+
+```{r}
+# Filter iucn categories for threatened species (CR, EN, VU) and near threatened (NT) species
+iucn_threatened <- iucn_new_cat %>% 
+  filter(redlist_category %in% c("CR","EN", "VU", "NT"))
+```
+
+```{r}
+# Merge in the iucn_lookup_sdm to get the AphiaID for the threatened species
+aphiaid_threatened <- inner_join(iucn_lookup_sdm, iucn_threatened, by = c("iucn_assessment_id" = "assessment_id")) 
+```
+
+```{r}
+# Get aphiaids for the threatened species
+aphiaid_threat <- unique(aphiaid_threatened$aphia_id)
+```
+
+## Prep AquaX data
+We'll be working with the 1,323 at-risk species
+
+```{r}
+# read in meta data on the aquax species
+load("/home/shares/data-aquax/META_02122025.Rdata")
+```
+
+```{r}
+meta_clean <- META %>% 
+  mutate(worms_name = tolower(ScientificName)) %>% 
+  select(!ScientificName) %>% 
+  # simplify for now for easier viewing
+  select(AphiaID, SPID, worms_name, GROUP, NR_CR, range_pixels, SDM)
+```
+
+```{r}
+spp_fs <- list.files('/home/shares/data-aquax/SDM',
+                     full.names = TRUE)
+
+df <- data.frame(f = spp_fs) %>%
+    mutate(fsize = file.size(f),
+           aphiaid = str_extract(basename(f), '[0-9]+') %>% as.integer()) %>%
+    left_join(META, by = c('aphiaid' = 'AphiaID'))
+```
+
+```{r}
+# Filter for the AphiaID of the threatend species - get 1,047 threatened species and 276 non-threatened species with SDMs
+df_threatened <- df %>% 
+  filter(aphiaid %in% aphiaid_threat)
+```
+
+```{r}
+test_f <- read_parquet("/home/shares/data-aquax/SDM/FINAL_EMSDM_EMMEAN_SP_1017389.parquet")
+```
+
+```{r}
+set.seed(123)
+test_spp_30 <- slice_sample(df_threatened, n = 30)
+files_30 <- test_spp_30$f
+aphiaid_30 <- test_spp_30$aphiaid
+```
+
+```{r}
+test_r <- rast(test_f, crs = "EPSG:4326") %>%
+    extend(ext(eez_raster_mrgid))
+```
+
+```{r}
+# Test plot
+plot(test_r_eq$RCP45_2050)
+```
+
+```{r}
+r_binary45_2050 <- ifel(test_r[["RCP45_2050"]] >= mean(test_f$cutoff, na.rm = TRUE), 1, NA)
+```
+
+```{r}
+# Have to use the EEZ raster with the numeric IDs (MRGID) for zonal stats
+# Try // - took 2 min
+system.time({
+  eez_list_zonal <- parallel::mclapply(aphiaid_30, FUN = extract_eez_zonal, 
+                                       df = test_spp_30, 
+                                       eez_raster = eez_raster_mrgid, 
+                                       mc.cores = 10)
+})
+```
+
+```{r}
+eez_list_all_zonal <- bind_rows(eez_list_zonal) 
+```
+
+```{r}
+eez_ids <- eez %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(MRGID, GEONAME)
+```
+
+```{r}
+eez_list_geoname <- left_join(eez_list_all_zonal, eez_ids)
+```
+
+
+```{r}
+eez_raster_df <- as.data.frame(eez_raster_mrgid_eq, xy = TRUE, cells = TRUE)
+eez_raster_df_non_eq <- as.data.frame(eez_raster_mrgid, xy = TRUE, cells = TRUE)
+```
+
+## Run full sample
+
+```{r}
+files <- df_threatened$f
+aphiaid <- df_threatened$aphiaid
+```
+
+```{r}
+# Try // - took 20 min for 1323 species and 4 scenarios (21 min for 987 species and 4 scenarios and 20 cores)
+system.time({
+  eez_list_threatened <- parallel::mclapply(aphiaid, FUN = extract_eez_zonal, 
+                                            df = df_threatened,
+                                            eez_raster = eez_raster_mrgid,
+                                            mc.cores = 40)
+})
+```
+
+```{r}
+eez_list_threatened_bind <- bind_rows(eez_list_threatened) 
+```
+
+```{r}
+# Merge in EEZ ids
+eez_threatened_ids <- left_join(eez_list_threatened_bind, (eez_simple %>% st_drop_geometry()))
+```
+
+```{r}
+# Save data
+write_csv(eez_threatened_ids, here("data/iucn_threatened_spp_eez_pxls_061626.csv"))
+```
+

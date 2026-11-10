@@ -1,0 +1,315 @@
+---
+title: "IUCN taxonomic groups and threats"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+    message: false
+    warning: false
+---
+```{r}
+library(tidyverse)
+library(here)
+library(janitor)
+library(sf)
+library(terra)
+library(arrow)
+library(patchwork)
+library(cowplot)
+library(collapse)
+library(rnaturalearth)
+```
+
+This document creates the taxonomic gropu bar graph for species entries and exits to EEZs. The second half of the document pulls the threat code for each species. 
+
+# Read in data and EEZs
+
+```{r}
+# Spp in EEZs
+spp_eez_pxl_count <- read_csv(here("data/iucn_threatened_spp_eez_pxls_061626.csv"))
+```
+
+```{r}
+eez <- st_read('/home/shares/usgs-cap-rangeshifts/spatial/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg')
+```
+
+```{r}
+eez <- st_read('/Users/abowd/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg')
+```
+
+```{r}
+# Get list of EEZ IDs that are not overlapping claims (i.e., POL_TYPE = 200NM)
+eez_200nm_list <- eez %>% 
+  filter(POL_TYPE == "200NM") %>% 
+  pull(MRGID)
+
+# Add Ukraine to list
+eez_200nm_list <- c(eez_200nm_list, 5695)
+```
+
+```{r}
+# EEZ terretories 
+eez_simple <- eez %>% 
+  dplyr::select(MRGID, GEONAME, SOVEREIGN1, TERRITORY1, ISO_TER1, ISO_SOV1) %>% 
+  st_drop_geometry() %>% 
+  filter(MRGID %in% eez_200nm_list) %>% 
+  mutate(ISO_TER1 = ifelse(is.na(ISO_TER1), ISO_SOV1, ISO_TER1))
+
+eez_simple_sf <- eez %>% 
+  dplyr::select(MRGID, GEONAME) %>% 
+  filter(MRGID %in% eez_200nm_list)
+```
+
+# Read in IUCN and AquaX data
+
+```{r}
+iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/ab9cd09931a4ce5c12d0bcd2984595d6522ed158/_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+```
+
+```{r}
+iucn_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data/iucn_redlist_2026/iucn_species_assessments.csv")
+```
+
+```{r}
+# Add aphiaid to iucn_cat
+iucn_cat_aphiaid <- left_join(iucn_cat, (iucn_lookup %>% dplyr::select(iucn_assessment_id, aphia_id)),
+ by = c("assessment_id" = "iucn_assessment_id")) %>% 
+  rename(aphiaid = aphia_id) 
+```
+
+# Plot taxonomic groups for species entries and exits to EEZs
+
+```{r}
+# Merge in iucn_cat to get group for each species
+spp_eez_pxl_count_group <- left_join(spp_eez_pxl_count, iucn_cat_aphiaid)
+```
+
+ ```{r}
+# read in meta data on the aquax species to get groups
+load("/home/shares/data-aquax/META_02122025.Rdata")
+```
+
+```{r}
+meta_clean <- META %>% 
+  mutate(worms_name = tolower(ScientificName)) %>% 
+  select(!ScientificName) %>% 
+  # simplify for now for easier viewing
+  select(AphiaID, SPID, worms_name, GROUP, phylum, class, family, HAB, NR_CR, range_pixels, SDM)
+```
+
+```{r}
+spp_eez_group_meta <- left_join(spp_eez_pxl_count_group, meta_clean, by = c("aphiaid" = "AphiaID")) %>% 
+    mutate(general_group = case_when(group %in% c("sharks_and_rays")~ "FISH: sharks & rays",
+                                   group %in% c("tunas_and_billfishes") ~ "FISH: tunas & billfishes",
+                                   TRUE ~ GROUP))
+```
+
+```{r}
+# Try applying species entries / exits by territories and sovereign EEZ
+eez_spp_pxls_long_sov <- left_join(spp_eez_group_meta %>% filter(MRGID %in% eez_200nm_list), eez_simple) %>% 
+  pivot_longer(cols = starts_with("n_RCP"),
+               names_to = "scenario",
+               values_to = "pxl_count") %>% 
+  mutate(scenario = str_remove(scenario, "n_")) %>% 
+  # Replace NA with 0, otherwise will be assigned to "continued presence"
+  mutate(pxl_count = replace_na(pxl_count, 0),
+         n_current = replace_na(n_current, 0)) %>% 
+  # Group by territory and sovereign EEZ to calcualte species entry and exit
+  group_by(ISO_TER1, ISO_SOV1, scenario, aphiaid, general_group, group) %>% 
+  summarize(sum_n_current = sum(n_current),
+            sum_pxl_count = sum(pxl_count)) %>% 
+  ungroup() %>% 
+  mutate(spp_change = case_when(sum_n_current < 1 &  sum_pxl_count >= 1 ~ 'entry into new',
+                            sum_n_current >= 1  & sum_pxl_count < 1 ~ 'exit from historical',
+                            sum_n_current < 1  & sum_pxl_count < 1 ~ 'no presence',
+                            TRUE ~ 'continued presence'))
+```
+
+```{r}
+# Which species have the most EEZ region entries?
+spp_eez_entry_count <- eez_spp_pxls_long_sov %>% 
+  #filter(MRGID %in% eez_200nm_list) %>%
+  filter(spp_change == "entry into new") %>% 
+  group_by(aphiaid, scenario, general_group, group) %>% 
+  summarise(n_eez_entry = n()) %>% 
+  ungroup()
+
+# Which species have the most EEZ region exits?
+spp_eez_exit_count <- eez_spp_pxls_long_sov %>% 
+  #filter(MRGID %in% eez_200nm_list) %>%
+  filter(spp_change == "exit from historical") %>% 
+  group_by(aphiaid, scenario, general_group, group) %>% 
+  summarise(n_eez_exit = n()) %>% 
+  ungroup()
+
+# Get list of EEZ exits 60 and over
+spp_exit_60 <- spp_eez_exit_count %>% 
+  filter(n_eez_exit >= 60,
+         scenario == "RCP45_2050")
+
+spp_exit_60_list <- spp_exit_60$aphiaid
+```
+
+```{r}
+# Bentfin devil ray - exits zero EEZs
+bdr <- eez_spp_pxls_long_sov %>% 
+  #filter(MRGID %in% eez_200nm_list) %>%
+  filter(scenario == "RCP45_2050") %>%
+  filter(spp_change == "entry into new") %>%
+  filter(aphiaid == 217430)
+  #filter(spp_change == "entry into new")
+```
+
+## Bar graph
+
+```{r}
+# Get eez group counts
+spp_eez_entry_count_iucn <- spp_eez_entry_count %>% 
+  group_by(general_group, scenario, n_eez_entry) %>% 
+  summarize(n_spp = n()) 
+
+spp_eez_exit_count_iucn <- spp_eez_exit_count %>% 
+  group_by(general_group, scenario, n_eez_exit) %>% 
+  summarize(n_spp = n()) 
+```
+
+```{r}
+spp_eez_entry_clean <- spp_eez_entry_count_iucn %>% 
+  filter(scenario == "RCP45_2050") %>% 
+  mutate(n_eez_entry_group = case_when(n_eez_entry >= 10 & n_eez_entry < 30 ~ "10-29",
+                                        n_eez_entry >= 30 & n_eez_entry < 60 ~ "30-59",
+                                         n_eez_entry >= 60 ~ ">=60",
+                                         TRUE ~ as.character(n_eez_entry)))
+
+```
+
+```{r}
+spp_eez_entry_clean$n_eez_entry_group <- factor(spp_eez_entry_clean$n_eez_entry_group, 
+levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", "30-59", ">=60"))
+```
+
+```{r}
+spp_eez_exit_clean <- spp_eez_exit_count_iucn %>% 
+  filter(scenario == "RCP45_2050") %>% 
+  mutate(n_eez_exit_group = case_when(n_eez_exit >= 10 & n_eez_exit < 30 ~ "10-29",
+                                        n_eez_exit >= 30 & n_eez_exit < 60 ~ "30-59",
+                                         n_eez_exit >= 60 ~ ">=60",
+                                         TRUE ~ as.character(n_eez_exit)))
+```
+
+```{r}
+spp_eez_exit_clean$n_eez_exit_group <- factor(spp_eez_exit_clean$n_eez_exit_group, 
+levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", "30-59", ">=60"))
+```
+
+```{r}
+spp_eez_exit_entry_clean <- rbind(spp_eez_exit_clean %>% 
+                                  dplyr::select(general_group, scenario, n_eez_exit_group, n_spp) %>% 
+                                  mutate(change = "Exits") %>% 
+                                  rename(n_eez_group = n_eez_exit_group),
+                                  spp_eez_entry_clean %>% 
+                                  dplyr::select(general_group, scenario, n_eez_entry_group, n_spp) %>% 
+                                  mutate(change = "Entries") %>% 
+                                  rename(n_eez_group = n_eez_entry_group))
+```
+
+```{r}
+spp_eez_exit_entry_clean$n_eez_group <- factor(spp_eez_exit_entry_clean$n_eez_group, 
+levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", "30-59", ">=60"))
+```
+
+```{r}
+entry_exit_barplot <- ggplot() +
+  geom_bar(data = spp_eez_exit_entry_clean,
+            aes(x = n_eez_group, y = n_spp, fill = general_group), stat = "identity") +
+  scale_fill_viridis_d(option = "turbo", direction = 1) +
+  scale_x_discrete(breaks = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", "30-59", ">=60")) +
+  theme_bw() +
+  facet_wrap(~change) + 
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.85, 0.8)) +
+  labs(#title = "EEZ entries and exits by taxonomic group",
+       x = "EEZ count",
+       y = "Species count",
+       fill = "Taxon")
+  
+```
+
+```{r}
+# Save bar plot
+ggsave(here("figures/rcp45_2050/iucn_atrisk_taxon_entry_exit_rcp45_1pxl_100926.png"), entry_exit_barplot, width = 10, height = 8, dpi = 300)
+
+```
+
+# Find IUCN threat codes for at-risk species 
+
+## IUCN threats
+For those species experiencing range shifts, what are the most common IUCN threats? Are there particular threats that are more common for species experiencing range loss vs gain?
+https://www.iucnredlist.org/resources/threat-classification-scheme
+
+```{r}
+library(iucnredlist) ### remotes::install_github("IUCN-UK/iucnredlist")
+```
+
+```{r}
+api_key <- Sys.getenv("IUCN_API_KEY") ### usethis::edit_r_environ() to add key to R environment file
+api <- init_api(api_key)
+```
+
+```{r}
+# Get IUCN ID data 
+iucn_id_data <- unique(spp_eez_pxl_count_group$assessment_id)
+```
+
+```{r}
+# still need to run this through assesment_data_many
+iucn_id_data <- assessment_data_many(api, iucn_id_data, wait_time = 0.5)
+```
+
+```{r}
+# run element_names() to see what categories can be extracted
+iucn_threats <- extract_element(iucn_id_data, "threats")
+```
+
+```{r}
+# Save data
+write_csv(iucn_threats, here("data/iucn_atrisk_spp_full_threat_codes_101126.csv"))
+```
+
+```{r}
+# Filter for only threats 5_4_1 (Intentional use: (subsistence/small scale) [harvest]) and 5_4_2 (Intentional use: (large scale) [harvest])
+threats_5_4 <- iucn_threats %>% 
+    filter(code %in% c("5_4_1", "5_4_2"))
+
+length(unique(threats_5_4$assessment_id))
+```
+
+```{r}
+threats_5_4_sum <- threats_5_4 %>% 
+    distinct(assessment_id, code) %>% 
+    group_by(assessment_id) %>%
+    summarize(threat_group = case_when(
+        n_distinct(code) == 2 ~ "both",
+        first(code) == "5_4_1" ~ "small only",
+        first(code) == "5_4_2" ~ "large only"
+    ),
+    .groups = "drop"
+    ) 
+
+threats_5_4_sum %>% count(threat_group)
+```
+
+```{r}
+# Group by threat code and count the unique number of assessment_ids in each
+iucn_threat_codes_summary <- iucn_threats %>% 
+    group_by(code, description) %>% 
+    summarize(n = length(unique(assessment_id)))
+```
+
+```{r}
+# Save data
+write_csv(iucn_threat_codes_summary, here("data/iucn_atrisk_spp_threat_codes_100226.csv"))
+```
+

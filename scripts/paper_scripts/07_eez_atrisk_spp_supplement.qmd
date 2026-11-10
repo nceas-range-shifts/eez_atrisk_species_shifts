@@ -1,0 +1,397 @@
+---
+title: "Supplemental Materials"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+    message: false
+    warning: false
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(janitor)
+library(sf)
+library(terra)
+library(arrow)
+library(patchwork)
+library(cowplot)
+```
+
+## Read in at-risk species data
+```{r}
+# Spp in EEZs
+spp_eez_pxl_count <- read_csv(here("data/iucn_threatened_spp_eez_pxls_061626.csv"))
+```
+
+
+## EEZs
+
+```{r}
+eez <- st_read('/Users/abowd/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg')
+```
+
+```{r}
+# Get list of EEZ IDs that are not overlapping claims (i.e., POL_TYPE = 200NM)
+eez_200nm_list <- eez %>% 
+  filter(POL_TYPE == "200NM") %>% 
+  pull(MRGID)
+
+# Add Ukraine to list
+eez_200nm_list <- c(eez_200nm_list, 5695)
+```
+
+```{r}
+eez_simple <- eez %>% 
+  dplyr::select(MRGID, GEONAME, SOVEREIGN1, TERRITORY1, ISO_TER1, ISO_SOV1, MRGID_SOV1, MRGID_TER1) %>% 
+  st_drop_geometry() %>% 
+  filter(MRGID %in% eez_200nm_list) %>% 
+  # For the territories that don't have ISO or IDs (like HI and AK), assign to SOV 
+  mutate(MRGID_TER1 = ifelse(is.na(ISO_TER1), MRGID_SOV1, MRGID_TER1),
+        ISO_TER1 = ifelse(is.na(ISO_TER1), ISO_SOV1, ISO_TER1))
+
+eez_simple_sf <- eez %>% 
+  dplyr::select(MRGID, GEONAME) %>% 
+  filter(MRGID %in% eez_200nm_list)
+```
+
+
+## Pixel thresholds
+
+```{r}
+eez_spp_pxls_long_1pxl <- left_join(spp_eez_pxl_count %>% filter(MRGID %in% eez_200nm_list), eez_simple) %>% 
+  pivot_longer(cols = starts_with("n_RCP"),
+               names_to = "scenario",
+               values_to = "pxl_count") %>% 
+  mutate(scenario = str_remove(scenario, "n_")) %>% 
+  # Replace NA with 0, otherwise will be assigned to "continued presence"
+  mutate(pxl_count = replace_na(pxl_count, 0),
+         n_current = replace_na(n_current, 0)) %>% 
+  # Group by territory and sovereign EEZ to calcualte species entry and exit
+  group_by(ISO_TER1, ISO_SOV1, scenario, aphiaid) %>% 
+  summarize(sum_n_current = sum(n_current),
+            sum_pxl_count = sum(pxl_count)) %>% 
+  ungroup() %>% 
+  mutate(spp_change = case_when(sum_n_current < 1 &  sum_pxl_count >= 1 ~ 'entry into new',
+                            sum_n_current >= 1  & sum_pxl_count < 1 ~ 'exit from historical',
+                            sum_n_current < 1  & sum_pxl_count < 1 ~ 'no presence',
+                            TRUE ~ 'continued presence')) %>% 
+  mutate(pxl_threshold = "1pxl") 
+
+eez_spp_pxls_long_10pxl <- left_join(spp_eez_pxl_count %>% filter(MRGID %in% eez_200nm_list), eez_simple) %>% 
+  pivot_longer(cols = starts_with("n_RCP"),
+               names_to = "scenario",
+               values_to = "pxl_count") %>% 
+  mutate(scenario = str_remove(scenario, "n_")) %>% 
+  # Replace NA with 0, otherwise will be assigned to "continued presence"
+  mutate(pxl_count = replace_na(pxl_count, 0),
+         n_current = replace_na(n_current, 0)) %>% 
+  # Group by territory and sovereign EEZ to calcualte species entry and exit
+  group_by(ISO_TER1, ISO_SOV1, scenario, aphiaid) %>% 
+  summarize(sum_n_current = sum(n_current),
+            sum_pxl_count = sum(pxl_count)) %>% 
+  ungroup() %>% 
+  mutate(spp_change = case_when(sum_n_current < 10 &  sum_pxl_count >= 10 ~ 'entry into new',
+                            sum_n_current >= 10  & sum_pxl_count < 10 ~ 'exit from historical',
+                            sum_n_current < 10  & sum_pxl_count < 10 ~ 'no presence',
+                            TRUE ~ 'continued presence')) %>% 
+  mutate(pxl_threshold = "10pxl")  
+
+eez_spp_pxls_long_100pxl <- left_join(spp_eez_pxl_count %>% filter(MRGID %in% eez_200nm_list), eez_simple) %>% 
+  # Drop overlapping claim EEZs
+  filter(MRGID %in% eez_200nm_list) %>%
+  pivot_longer(cols = starts_with("n_RCP"),
+               names_to = "scenario",
+               values_to = "pxl_count") %>% 
+  mutate(scenario = str_remove(scenario, "n_")) %>% 
+  # Replace NA with 0, otherwise will be assigned to "continued presence"
+  mutate(pxl_count = replace_na(pxl_count, 0),
+         n_current = replace_na(n_current, 0)) %>% 
+  # Group by territory and sovereign EEZ to calcualte species entry and exit
+  group_by(ISO_TER1, ISO_SOV1, scenario, aphiaid) %>% 
+  summarize(sum_n_current = sum(n_current),
+            sum_pxl_count = sum(pxl_count)) %>% 
+  ungroup() %>% 
+  mutate(spp_change = case_when(sum_n_current < 100 &  sum_pxl_count >= 100 ~ 'entry into new',
+                            sum_n_current >= 100  & sum_pxl_count < 100 ~ 'exit from historical',
+                            sum_n_current < 100  & sum_pxl_count < 100 ~ 'no presence',
+                            TRUE ~ 'continued presence')) %>% 
+  mutate(pxl_threshold = "100pxl")  
+                      
+```
+
+```{r}
+eez_spp_pxls_long_all <- bind_rows(eez_spp_pxls_long_1pxl, eez_spp_pxls_long_10pxl, eez_spp_pxls_long_100pxl) %>% filter(scenario == "RCP45_2050")
+```
+
+```{r}
+# Get counts of entry into new, exit from historical etc. by  EEZ region
+eez_spp_change_counts_all <- eez_spp_pxls_long_all %>% 
+  group_by(ISO_TER1, scenario, pxl_threshold, spp_change) %>% 
+  summarize(spp_change_count = n()) %>% 
+  ungroup()
+```
+
+```{r}
+# Pivot wide
+eez_spp_change_counts_all_wide <- eez_spp_change_counts_all  %>% 
+  filter(scenario == "RCP45_2050") %>%
+  pivot_wider(names_from = pxl_threshold, values_from = spp_change_count)
+```
+
+```{r}
+eez_names <- unique(eez_simple$ISO_TER1)
+
+eez_thresh <- expand.grid(
+  ISO_TER1    = eez_names,
+  pxl_threshold = c("1pxl", "10pxl", "100pxl")
+) %>% 
+  mutate(scenario = "RCP45_2050",
+         spp_change = "entry into new")
+
+eez_thresh_exit <- expand.grid(
+  ISO_TER1    = eez_names,
+  pxl_threshold = c("1pxl", "10pxl", "100pxl")
+) %>% 
+  mutate(scenario = "RCP45_2050",
+         spp_change = "exit from historical")
+```
+
+```{r}
+# Merge in eez_thresh so that each country is included for 1, 10, and 100 thresholds even if there are no species entries
+spp_entry_long_all <- left_join(eez_thresh, eez_spp_change_counts_all %>% filter(spp_change == "entry into new")) %>% 
+  replace_na(list(spp_change_count = 0))
+
+spp_exit_long_all <- left_join(eez_thresh_exit, eez_spp_change_counts_all %>% filter(spp_change == "exit from historical")) %>% 
+  replace_na(list(spp_change_count = 0))
+```
+
+
+```{r}
+# Summary table to create figure
+spp_entry_summary <- spp_entry_long_all %>% 
+  mutate(n_spp_entry_cat = case_when(spp_change_count >= 30 ~ ">=30",
+                                     spp_change_count >= 10 & spp_change_count <30 ~ "10-29",
+                                     TRUE ~ as.character(spp_change_count))) %>% 
+  group_by(n_spp_entry_cat, pxl_threshold, scenario, spp_change) %>% 
+  summarize(n_eez = n())
+
+spp_exit_summary <- spp_exit_long_all %>% 
+  mutate(n_spp_exit_cat = case_when(spp_change_count >= 30 ~ ">=30",
+                                     spp_change_count >= 10 & spp_change_count <30 ~ "10-29",
+                                     TRUE ~ as.character(spp_change_count))) %>% 
+  group_by(n_spp_exit_cat, pxl_threshold, scenario, spp_change) %>% 
+  summarize(n_eez = n())
+```
+
+```{r}
+spp_entry_summary$n_spp_entry_cat <- factor(spp_entry_summary$n_spp_entry_cat, 
+levels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", ">=30"))
+
+entry_barplot <- ggplot(data = spp_entry_summary, aes(x = n_spp_entry_cat, y = n_eez,
+                                         fill = fct_rev(pxl_threshold))) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_d(labels = c("1pxl" = "1 pixel", "10pxl" = "10 pixels", "100pxl" = "100 pixels")) +
+  theme_minimal() +
+  labs(fill = "threshold",
+       title = "",
+       y = "EEZ count",
+       x = "Species entry count") +
+    theme(legend.position = "none")
+```
+
+```{r}
+spp_exit_summary$n_spp_exit_cat <- factor(spp_exit_summary$n_spp_exit_cat, 
+levels = c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10-29", ">=30"))
+
+exit_barplot <- ggplot(data = spp_exit_summary, aes(x = n_spp_exit_cat, y = n_eez,
+                                         fill = fct_rev(pxl_threshold))) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_d(labels = c("1pxl" = "1 pixel", "10pxl" = "10 pixels", "100pxl" = "100 pixels")) +
+  theme_minimal() +
+  labs(fill = "threshold",
+       title = "",
+       y = "EEZ count",
+       x = "Species exit count")+
+    theme(legend.position = "bottom")
+```
+
+```{r}
+barplot_count <- plot_grid(entry_barplot, exit_barplot, ncol = 1, align = "v",
+labels = c("A", "B"), rel_heights = c(1,1))
+```
+
+```{r}
+# Save arranged maps
+ggsave(here("figures/rcp45_2050/supplement_threshold_count_rcp45_102126.png"), 
+  barplot_count, width = 5, height = 7, dpi = 600, units = "in")
+
+```
+
+## New, lost, and current species counts by196 territory and sovereign EEZ
+
+```{r}
+# Get names of sovereigns and territories from rnatural earth package
+library(rnaturalearth)
+ne_countries <- ne_countries(scale = "medium", returnclass = "sf") %>% 
+  #dplyr::select(iso_a3, sovereignt, name_long) %>% 
+  st_drop_geometry() %>% 
+  rename(ISO_TER1 = iso_a3,
+         SOVEREIGN1_NAME = sovereignt,
+         ISO_TER1_NAME = name_long)
+```
+
+```{r}
+eez_terr_sov <- left_join(eez_simple, ne_countries, by = c("ISO_TER1" = "ISO_TER1")) %>% 
+  dplyr::select(MRGID, GEONAME, SOVEREIGN1, TERRITORY1, ISO_TER1, ISO_SOV1, ISO_TER1_NAME, SOVEREIGN1_NAME) %>% 
+  #filter(MRGID %in% eez_200nm_list) %>% 
+  mutate(ISO_TER1 = ifelse(is.na(ISO_TER1), ISO_SOV1, ISO_TER1),
+        ISO_TER1_NAME = ifelse(is.na(ISO_TER1_NAME), SOVEREIGN1, ISO_TER1_NAME)) %>% 
+  group_by(ISO_TER1, ISO_TER1_NAME, ISO_SOV1, SOVEREIGN1) %>%
+  summarize(regions = n()) %>% 
+  ungroup()
+```
+
+```{r}
+# Find those territories that don't have unique names but have unique ISO_TER1 codes
+eez_ter_name_duplicate <- eez_terr_sov %>% 
+  filter(ISO_TER1_NAME %in% ISO_TER1_NAME[duplicated(ISO_TER1_NAME)]) %>% 
+  arrange(ISO_TER1_NAME) %>% 
+  # Filter for those where the territory code does not equal the sovereign code (so gets rid of FRA and US countries) %>% 
+  filter(ISO_TER1 != ISO_SOV1)
+
+name_change <- eez_ter_name_duplicate$ISO_TER1
+
+# Replace names
+eez_name_change <- eez_ter_name_duplicate %>% 
+  mutate(ISO_TER1_NAME = case_when(ISO_TER1 == "CCK" ~ "Cocos (Keeling) Islands",
+                                   ISO_TER1 == "CXR" ~ "Christmas Island",
+                                   ISO_TER1 == "GLP" ~ "Guadeloupe",
+                                   ISO_TER1 == "GUF" ~ "French Guiana",
+                                   ISO_TER1 == "MTQ" ~ "Martinique",
+                                   ISO_TER1 == "REU" ~ "Réunion",
+                                   ISO_TER1 == "BES" ~ "Bonaire, Sint Eustatius and Saba",
+                                   ISO_TER1 == "TKL" ~ "Tokelau",
+                                   ISO_TER1 == "SJM" ~ "Svalbard and Jan Mayen",
+                                   ISO_TER1 == "UMI" ~ "US Minor Outlying Islands",
+                                   TRUE ~ as.character(ISO_TER1_NAME)))
+
+# Add back to dataset
+eez_terr_sov_clean <- eez_terr_sov %>% 
+  filter(!ISO_TER1 %in% name_change) %>% 
+  bind_rows(eez_name_change)
+```
+
+```{r}
+# Get counts of entry into new, exit from historical etc. by territory and sovereign EEZ - but only count if the species is entirely new or loss from territory andsovereign EEZ
+eez_spp_change_sov_counts <- eez_spp_pxls_long_1pxl  %>% 
+  group_by(ISO_TER1, ISO_SOV1, scenario, spp_change) %>% 
+  summarize(spp_change_count = n()) %>% 
+  ungroup()
+```
+
+```{r}
+# Select RCP4.5 2050 and join with eez_terr_sov_clean to include all the EEZs
+eez_spp_change_rcp45_2050 <- eez_spp_change_sov_counts %>% 
+  filter(scenario == "RCP45_2050") %>% 
+  right_join(eez_terr_sov_clean, by = c("ISO_TER1", "ISO_SOV1")) %>% 
+  replace_na(list(spp_change_count = 0))
+```
+
+```{r}
+eez_sov_c_f <- eez_spp_change_sov_counts  %>% 
+    filter(scenario == "RCP45_2050") %>%
+  mutate(spp_change = str_replace_all(spp_change, " ", "_")) %>% 
+  pivot_wider(names_from = spp_change, values_from = spp_change_count) %>%
+  # join in all EEZs
+  right_join(eez_terr_sov_clean, by = c("ISO_TER1", "ISO_SOV1")) %>%
+  mutate(continued_presence = replace_na(continued_presence, 0),
+         exit_from_historical = replace_na(exit_from_historical, 0),
+         entry_into_new = replace_na(entry_into_new, 0),
+         no_presence = replace_na(no_presence, 0)) %>%
+  mutate(current_spp = continued_presence + exit_from_historical,
+         future_spp = continued_presence + entry_into_new) 
+```
+
+```{r}
+eez_sov_c_f_clean <- eez_sov_c_f %>% 
+    dplyr::select(ISO_TER1_NAME, SOVEREIGN1, ISO_TER1, ISO_SOV1, entry_into_new, exit_from_historical, current_spp, future_spp) %>% 
+    arrange(desc(entry_into_new)) %>%
+    rename(territory = ISO_TER1_NAME,
+           sovereign = SOVEREIGN1,
+           terr_iso_code = ISO_TER1,
+           sov_iso_code = ISO_SOV1,
+           new_species = entry_into_new,
+           lost_species = exit_from_historical,
+           current_species = current_spp,
+           future_species = future_spp)
+```
+
+
+```{r}
+write_csv(eez_sov_c_f_clean, here("data/iucn_eez_spp_change_table_rcp45_2050_102126.csv"))
+```
+
+## At-risk species list 
+
+```{r}
+iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/ab9cd09931a4ce5c12d0bcd2984595d6522ed158/_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+```
+
+```{r}
+iucn_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data/iucn_redlist_2026/iucn_species_assessments.csv")
+```
+
+```{r}
+# Filter the iucn_lookup for species with an SDM
+iucn_lookup_sdm <- iucn_lookup %>% filter(aquax == "SDM")
+```
+
+```{r}
+# Filter iucn categories for threatened species (CR, EN, VU) and near threatened (NT) species
+iucn_threatened <- iucn_cat %>% 
+  filter(redlist_category %in% c("CR","EN", "VU", "NT"))
+```
+
+```{r}
+# Merge in the iucn_lookup_sdm to get the AphiaID for the threatened species
+aphiaid_threatened <- inner_join(iucn_lookup_sdm, iucn_threatened, by = c("iucn_assessment_id" = "assessment_id")) 
+```
+
+```{r}
+# Merge in iucn_cat to get group for each species
+spp_eez_pxl_count_group <- left_join(spp_eez_pxl_count, iucn_cat_aphiaid)
+```
+
+ ```{r}
+# read in meta data on the aquax species to get groups
+load("/home/shares/data-aquax/META_02122025.Rdata")
+```
+
+```{r}
+meta_clean <- META %>% 
+  mutate(worms_name = tolower(ScientificName)) %>% 
+  select(!ScientificName) %>% 
+  # simplify for now for easier viewing
+  select(AphiaID, SPID, worms_name, GROUP, phylum, class, family, HAB, NR_CR, range_pixels, SDM)
+```
+
+```{r}
+aphiaid_threatened_group <- left_join(aphiaid_threatened, meta_clean, by = c("aphia_id" = "AphiaID")) %>% 
+    mutate(general_group = case_when(group %in% c("sharks_and_rays")~ "FISH: sharks & rays",
+                                   group %in% c("tunas_and_billfishes") ~ "FISH: tunas & billfishes",
+                                   TRUE ~ GROUP))
+```
+
+
+```{r}
+aphiaid_threatened_group_clean <- aphiaid_threatened_group %>% 
+  dplyr::select(iucn_sciname, worms_valid_sciname, iucn_assessment_id, aphia_id, redlist_category, group, GROUP, general_group)
+```
+
+```{r}
+write_csv(aphiaid_threatened_group_clean, here("data/iucn_atrisk_spp_table_102126.csv"))
+```
