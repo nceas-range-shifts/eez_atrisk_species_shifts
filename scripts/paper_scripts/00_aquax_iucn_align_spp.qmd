@@ -1,0 +1,469 @@
+---
+title: Download IUCN Red List assessments and align to WoRMS
+author: "Casey O'Hara"
+format:
+  html:
+    embed-resources: true
+---
+
+## Summary
+
+Access IUCN Red List assessments for marine species (and comprehensively assessed groups) via the IUCN API, then align species names to WoRMS accepted names and AphiaIDs. Results are saved to `_data/iucn_redlist_2026/`.
+
+Data sources:
+
+* IUCN Red List API — requires API key set as `IUCN_API_KEY` in `.Renviron`
+  * R package: `iucnredlist` (https://github.com/IUCN-UK/iucnredlist)
+  * Citation: IUCN (2026). The IUCN Red List of Threatened Species. Version 2026. https://www.iucnredlist.org
+* WoRMS REST API (for name resolution and synonym lookup): https://www.marinespecies.org/rest/
+  * Citation: WoRMS Editorial Board (2026). World Register of Marine Species. https://doi.org/10.14284/170
+* Species name/AphiaID update table: https://raw.githubusercontent.com/mapping-marine-spp-vuln/spp_vuln_framework/refs/heads/master/update/update_sciname_aphia.csv
+
+
+## Methods
+
+### Gather IUCN assessed marine species
+
+Access IUCN API to get a list of all assessed marine spp.
+
+```{r load packages}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(here)
+library(taxize)      ### remotes::install_github('ropensci/taxize')
+library(iucnredlist) ### remotes::install_github("IUCN-UK/iucnredlist")
+
+### Initialize the API with API key from .Renviron
+api <- init_api(Sys.getenv('IUCN_API_KEY'))
+
+source(here('common_fxns.R'))
+```
+
+Identify assessments for marine species.
+
+```{r}
+marine_assess_f <- here('_data/iucn_redlist_2026/int/iucn_marine_assessments.csv')
+
+if(!file.exists(marine_assess_f)) {
+  systems <- list_codes(api, 'systems')
+  ### Marine = 2
+  
+  marine_assessments <- assessments_by_group(
+    api,
+    group = 'systems', code = 2, scope = 1)
+  
+  marine_assess_df <- marine_assessments %>%
+    select(sis_taxon_id, assessment_id, year_published) %>%
+    distinct() %>%
+    mutate(year_published = as.integer(year_published))
+  
+  write_csv(marine_assess_df, marine_assess_f)
+}
+
+marine_assess_df <- read_csv(marine_assess_f, show_col_types = FALSE)
+```
+
+Identify comprehensively assessed groups, then pull assessment info for them.
+
+```{r}
+comp_gp_assess_f <- here('_data/iucn_redlist_2026/int/iucn_comp_group_assessments.csv')
+
+if(!file.exists(comp_gp_assess_f)) {
+  comp_gps <- list_codes(api, 'comprehensive_groups')
+  
+  comp_gps_marine <- comp_gps %>%
+    filter(comp) %>%
+    mutate(keep = case_when(
+      higher_name == 'selected_bony_fishes' ~ TRUE,
+      higher_name == 'birds'                ~ TRUE,
+      higher_name == 'mammals'              ~ TRUE,
+      higher_name == 'reef_forming_corals'  ~ TRUE,
+      ### exclude chameleons from reptiles:
+      name == 'chameleons'                  ~ FALSE,
+      higher_name == 'selected_reptiles'    ~ TRUE,
+      higher_name == 'selected_gastropods'  ~ TRUE,
+      higher_name == 'sharks_and_rays'      ~ TRUE,
+      name == 'hagfishes'                   ~ TRUE,
+      name == 'mangrove_plants'             ~ TRUE,
+      name == 'seagrasses'                  ~ TRUE,
+      name == 'lobsters'                    ~ TRUE,
+      TRUE                                  ~ FALSE)) %>%
+    filter(keep) %>% select(-keep)
+  
+  gp_names <- comp_gps_marine$name %>% sort()
+  
+  comp_gp_assessments <- purrr::map(
+    .x = gp_names, 
+    .f = ~ assessments_by_group(
+      api = api,
+      group = 'comprehensive_groups',
+      code = .x,
+      scope = 1
+    )
+  )
+  
+  comp_gp_assess_df <- comp_gp_assessments %>%
+    setNames(gp_names) %>%
+    bind_rows(.id = 'group') %>%
+    select(group, sis_taxon_id, assessment_id, year_published) %>%
+    distinct() %>%
+    mutate(year_published = as.integer(year_published))
+  
+  write_csv(comp_gp_assess_df, comp_gp_assess_f)
+}
+
+comp_gp_assess_df <- read_csv(comp_gp_assess_f, show_col_types = FALSE)
+table(comp_gp_assess_df$group)
+```
+
+### Identify scientific names
+
+Create a dataframe of all marine species, including both comprehensively assessed groups and otherwise.  Left join ensures all marine species are kept; any with no "group" listed are not in the comprehensively assessed dataframe.
+
+```{r}
+marine_comp_gp_df <- marine_assess_df %>%
+  left_join(comp_gp_assess_df, by = c('sis_taxon_id', 'assessment_id', 'year_published')) %>%
+  mutate(group = ifelse(is.na(group), 'not comprehensively assessed', group))
+
+table(marine_comp_gp_df$group)
+```
+
+Using `sis_taxon_id` query scientific names.  While we're here, parse red list category and year assessed.  Chunk first checks to see if the final file is complete; if not, loops over each assessment, pinging API only if temp file is not present, then binds all temp files to create the final file.
+
+```{r}
+iucn_spp_assessment_f <- here('_data/iucn_redlist_2026/iucn_species_assessments.csv')
+
+if(!file.exists(iucn_spp_assessment_f)) {
+  assess_id_vec <- marine_comp_gp_df$assessment_id %>% as.integer()
+    ### as.integer coerces 7e+06 to 7000000
+  group_vec <- marine_comp_gp_df$group
+  
+  assess_tmp_fstem <- here('tmp/redlist_assess_%s.csv')
+  
+  assess_tmp_f_vec <- sprintf(assess_tmp_fstem, assess_id_vec)
+  assess_to_do <- assess_id_vec[!file.exists(assess_tmp_f_vec)]
+  
+  message('Processing ', length(assess_to_do), ' remaining assessments...')
+  
+  ### Loop over assessment IDs
+  for(i in seq_along(assess_to_do)) {
+    ### i <- 1
+    
+    assess_id <- as.integer(assess_to_do[i])
+    assess_tmp_f <- sprintf(assess_tmp_fstem, assess_id)
+    
+    if(file.exists(assess_tmp_f)) {
+      # message(i, '. file exists: ', basename(assess_tmp_f), '... skipping!')
+      next()
+    }
+    
+    group <- group_vec[which(assess_id_vec == assess_id)]
+    # message(i, '. Finding assessment data for assessment ', assess_id, '...')
+    
+    Sys.sleep(1) ### pause to be kind to API
+    x <- assessment_data(api, assess_id)
+    
+    ### extract data
+    sis_taxon_id <- x$sis_taxon_id
+    sciname      <- x$taxon$scientific_name
+    rl_version   <- x$red_list_category$version
+    rl_category  <- x$red_list_category$code
+    year         <- x$year_published %>% as.integer()
+    scope        <- x$scopes[[1]]$description$en
+    
+    df <- data.frame(group,
+                     sis_taxon_id,
+                     assessment_id = assess_id,
+                     sciname,
+                     redlist_version = rl_version,
+                     redlist_category = rl_category,
+                     assessed_year = year,
+                     scope)
+    
+    write_csv(df, assess_tmp_f)
+  }
+  
+  ### bind all temp files and write out final file
+  assess_tmp_f_vec <- sprintf(assess_tmp_fstem, assess_id_vec)
+  if(any(!file.exists(assess_tmp_f_vec))) stop('Missing one or more tmp files!')
+  
+  # system.time({ ### very slow - reading in 20k files!
+  assess_all_list <- parallel::mclapply(
+    X = assess_tmp_f_vec, 
+    FUN = read_csv, 
+    show_col_types = FALSE,
+    mc.cores = 100)
+  # })
+  
+  ### account for early files not having assessment_id built in:
+  assess_all_df <- assess_all_list %>%
+    setNames(str_extract(basename(assess_tmp_f_vec), '[0-9]+')) %>%
+    bind_rows(.id = 'assess_id') %>%
+    select(-assessment_id, assessment_id = assess_id) %>%
+    mutate(assessment_id = as.integer(assessment_id))
+  # assess_all_df <- assess_all_list %>%
+  #   bind_rows()
+
+  write_csv(assess_all_df, iucn_spp_assessment_f)
+}
+
+assess_all_df <- read_csv(iucn_spp_assessment_f, show_col_types = FALSE)
+
+# x <- list.files(here('tmp'), pattern = 'redlist_assess_.*.csv', full.names = TRUE)
+# unlink(x)
+```
+
+### Compare IUCN scinames to WoRMS names
+
+First, compare to the AquaX META which contains ~200k sciname/aphia IDs pairs across various taxa.  This is more comprehensive than the datasets for traits and functional entities, as those focus on animals only.  Though, this does assume that the AquaX version is up to date... but since that's what we're using for SDMs, seems legit.
+
+```{r}
+get_aquax_meta <- function(meta = 'META_02122025.Rdata', sdm = TRUE) {
+  load(here_aquax(meta))
+  meta_clean <- META %>%
+    janitor::clean_names()
+  if(sdm) meta_clean <- meta_clean %>%
+    filter(sdm == 'SDM')
+  return(meta_clean)
+}
+```
+
+```{r}
+aquax_meta <- get_aquax_meta(sdm = FALSE)
+aquax_sciname_aphia <- aquax_meta %>%
+  select(sciname = scientific_name, aphia_id, sdm, iucn_map)
+
+iucn_aphia_match1 <- inner_join(assess_all_df, aquax_sciname_aphia, by = 'sciname') %>%
+  mutate(valid_sciname = sciname)
+```
+
+Next, check against the species already listed in the `spp_vuln_framework` or `funct_entity` datasets to identify Aphia IDs.  For any species not listed there, ping WoRMS API (via `taxize`) to resolve missed matches.
+
+```{r}
+no_aquax_match <- assess_all_df %>%
+  filter(!sciname %in% iucn_aphia_match1$sciname)
+
+sciname_aphia_update <- read_csv('https://raw.githubusercontent.com/mapping-marine-spp-vuln/spp_vuln_framework/refs/heads/master/update/update_sciname_aphia.csv',
+                                 show_col_types = FALSE) %>%
+  mutate(sciname = str_to_sentence(sciname),
+         valid_sciname = str_to_sentence(valid_sciname))
+
+iucn_aphia_match2 <- inner_join(no_aquax_match, sciname_aphia_update, by = 'sciname')
+```
+
+### Resolve unmatched spp with `taxize`
+
+For the remaining unmatched spp names, ping the WoRMS API to get valid names and Aphia IDs.
+
+Set up for `taxize`:
+
+```{r}
+check_classification <- function(x) {
+  y <- classification(x, db = 'worms', ask = FALSE)
+  if(is.data.frame(y[[1]])) {
+    z <- y[[1]] %>%
+      filter(rank == 'Species') %>%
+      select(sciname_match = name, aphia_id = id) %>%
+      mutate(sciname_query = x)
+    return(z)
+  } else {
+    return(data.frame(sciname_query = x, aphia_id = NA))
+  }
+}
+
+pass1_f <- here('_data/iucn_redlist_2026/int/iucn_worms_check_pass1.csv')
+
+if(!file.exists(pass1_f)) {
+  spp_vec <- assess_all_df %>%
+    filter(!sciname %in% iucn_aphia_match1$sciname) %>%
+    filter(!sciname %in% iucn_aphia_match2$sciname) %>%
+    .$sciname
+  
+  pass1_list <- lapply(X = spp_vec,
+                       FUN = check_classification)
+  
+  pass1_df <- pass1_list %>%
+    bind_rows()
+  
+  write_csv(pass1_df, pass1_f)
+}
+
+pass1_df <- read_csv(pass1_f, show_col_types = FALSE) %>%
+  rename(sciname = sciname_query,
+         valid_sciname = sciname_match) %>%
+  filter(!is.na(aphia_id)) %>%
+  left_join(assess_all_df, by = 'sciname')
+```
+
+
+### Validate: how may AquaX IUCN-mapped spp with SDM maps are not linked?
+
+```{r}
+iucn_aquax_check <- aquax_sciname_aphia %>%
+  filter(iucn_map == 1) %>%
+  filter(!aphia_id %in% c(iucn_aphia_match1$aphia_id, iucn_aphia_match2$aphia_id, pass1_df$aphia_id))
+```
+
+These species appear to be IUCN assessed under a synonym or old name, as IUCN assessments are conservative about changing taxonomic names while WoRMS tries to remain up to date with the latest versions.  But I just found that the WoRMS API has an "external identifier" endpoint where we can ping Aphia ID to get the matching IUCN ID... let's try that!
+
+```{r}
+
+aphia_to_sis_file <- here::here('_data/iucn_redlist_2026/int/worms_aphia_to_iucn_sis.csv')
+
+if(!file.exists(aphia_to_sis_file)) {
+  get_sis <- function(aphia_id) {
+    ext_id_url_stem <- 'https://www.marinespecies.org/rest/AphiaExternalIDByAphiaID/%s?type=iucn'
+    ext_id_url <- sprintf(ext_id_url_stem, aphia_id)
+    Sys.sleep(1) ### be polite to the API!
+    y <- try(jsonlite::fromJSON(ext_id_url), silent = TRUE)
+    if(class(y) == 'try-error') {
+      return(data.frame(aphia_id, error = y[1]))
+    }
+    
+    ### no error - grab sciname
+    name_url_stem <- 'https://www.marinespecies.org/rest/AphiaNameByAphiaID/%s'
+    name_url <- sprintf(name_url_stem, aphia_id)
+    Sys.sleep(1) ### be polite to the API!
+    z <- try(jsonlite::fromJSON(name_url), silent = TRUE)
+    if(class(z) == 'try-error') {
+      return(data.frame(aphia_id, sis_taxon_id = y, error = z[1]))
+    }
+    
+    return(data.frame(aphia_id, sis_taxon_id = y, valid_sciname = z))
+  }
+  
+  aphia_vec <- iucn_aquax_check$aphia_id %>% sort()
+
+  aphia_to_sis_list <- lapply(aphia_vec, get_sis)
+  
+  aphia_to_sis_df <- bind_rows(aphia_to_sis_list)
+
+  
+  write_csv(aphia_to_sis_df, aphia_to_sis_file)
+}
+
+aphia_to_sis_df <- read_csv(aphia_to_sis_file, show_col_types = FALSE)
+```
+
+This results in a high error rate... let's try synonyms?
+
+```{r}
+syn_file <- here::here('_data/iucn_redlist_2026/int/worms_synonyms.csv')
+
+if(!file.exists(syn_file)) {
+  get_syns <- function(aphia_id) {
+    url_stem <- 'https://www.marinespecies.org/rest/AphiaSynonymsByAphiaID/%s'
+    
+    Sys.sleep(1) ### be polite to the API!
+    y <- try(jsonlite::fromJSON(sprintf(url_stem, aphia_id)), silent = TRUE)
+    if(is.data.frame(y)) {
+      df <- y %>%
+        select(syn_id = AphiaID, syn_name = scientificname, valid_aphia_id = valid_AphiaID, valid_sciname = valid_name)
+    } else {
+      df <- data.frame(error = y[1])
+    }
+    return(df)
+  }
+  
+  aphia_vec <- iucn_aquax_check$aphia_id %>% sort()
+
+  synonym_list <- lapply(aphia_vec, get_syns) %>%
+    setNames(aphia_vec)
+  
+  synonym_df <- bind_rows(synonym_list, .id = 'query')
+  
+  write_csv(synonym_df, syn_file)
+}
+
+synonym_df <- read_csv(syn_file, show_col_types = FALSE)
+```
+
+Combine the two, hopefully the errors will not overlap!
+
+```{r}
+syn_errors <- synonym_df %>%
+  filter(!is.na(error)) %>%
+  .$query
+
+aphia_sis_errors <- aphia_to_sis_df %>%
+  filter(!is.na(error)) %>%
+  .$aphia_id
+sum(syn_errors %in% aphia_sis_errors)
+
+syn_fix <- synonym_df %>%
+  filter(is.na(error)) %>%
+  inner_join(assess_all_df, by = c('syn_name' = 'sciname')) %>% 
+  rename(sciname = syn_name, 
+         aphia_id = valid_aphia_id)
+
+aphia_sis_fix <- assess_all_df %>%
+  inner_join(aphia_to_sis_df, by = 'sis_taxon_id')
+
+```
+
+
+### Unresolved spp in AquaX?
+
+There are 16 remaining AquaX SDMs flagged as IUCN but without an IUCN match.  If important, we could do these manually...
+
+```{r}
+aphia_matched <- iucn_aphia_match1 %>%
+  bind_rows(iucn_aphia_match2, pass1_df, aphia_sis_fix, syn_fix) %>%
+  .$aphia_id
+aquax_iucn_manual <- aquax_meta %>%
+  filter(iucn_map == 1) %>%
+  filter(sdm == 'SDM') %>%
+  filter(!aphia_id %in% aphia_matched) %>%
+  ### taking the AquaX name as the worms_valid_sciname
+  select(worms_valid_sciname = scientific_name, aphia_id, aquax = sdm) %>%
+  mutate(iucn_sciname = NA, sis_taxon_id = NA, iucn_assessment_id = NA) %>%
+  distinct()
+
+aquax_iucn_manual_f <- here('_data/iucn_redlist_2026/int/aquax_iucn_manual.csv')
+
+### DO NOT OVERWRITE!  There is a _protect version just in case
+if(!file.exists(aquax_iucn_manual_f)) write_csv(aquax_iucn_manual, aquax_iucn_manual_f)
+
+aquax_iucn_manual <- read_csv(aquax_iucn_manual_f, show_col_types = FALSE)
+
+```
+
+### Combine resolved scinames/ids and save out
+
+Duplicate IUCN scinames may occur when a species name matched directly or fuzzily is pinged against the Aphia-SIS fix or synonym fix - generally hitting on a synonym that is not the valid sciname.  For these, group by IUCN sciname and keep any distinct observations where the Aphia ID is in the AquaX metadata, which tends to drop the false synonym in favor of the true valid_sciname.
+
+Most duplicated WoRMS names occur because of overlap between the synonym fix and Aphia-SIS fix.  These are mostly handled by `distinct()`.
+
+The few remaining duplicates of IUCN scinames indicate species with one SIS ID connected to two Aphia IDs.  In two of these, only one of the Aphia IDs is linked to a SDM so no worries about duplicated maps.  In two other cases, neither Aphia ID is linked to an SDM.  In the case of *Chromis multilineata* --> *Chromis multilineata* and *Azurina multilineata*, both Aphia IDs are linked to SDMs despite *Chromis multilineata* being an unaccepted superseded name.  Check these; are the maps the same?
+
+The few remaining duplicates of WoRMS valid names indicate where IUCN assessments are linked to multiple synonyms of the same species (e.g., *Acanthopagrus datnia* has IUCN assessments under both *Acanthopagrus longispinnis* and *Sparidentex datnia* - one Aphia ID and two SIS IDs.)
+
+```{r}
+iucn_aphia_df <- iucn_aphia_match1 %>%
+  bind_rows(iucn_aphia_match2, pass1_df, aphia_sis_fix, syn_fix) %>%
+  select(iucn_sciname = sciname, worms_valid_sciname = valid_sciname, 
+         sis_taxon_id, iucn_assessment_id = assessment_id, aphia_id) %>%
+  bind_rows(aquax_iucn_manual) %>%
+  distinct() %>%
+  mutate(across(where(is.character), tolower)) %>%
+  ### drop duplicated IUCN names with no Aphia ID in the AquaX data
+  group_by(iucn_sciname) %>%
+  filter(n() == 1 | aphia_id %in% aquax_meta$aphia_id) %>%
+  ungroup() %>%
+  ### add AquaX SDM status as `aquax` column
+  left_join(aquax_meta %>% select(aphia_id, sdm), by = 'aphia_id') %>%
+  mutate(aquax = ifelse(is.na(sdm), 'Not in AquaX', sdm)) %>%
+  select(-sdm)
+
+write_csv(iucn_aphia_df, here('_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv'))
+```
+
+```{r}
+dupe_iucn <- janitor::get_dupes(iucn_aphia_df, iucn_sciname)
+dupe_aquax <- janitor::get_dupes(iucn_aphia_df, worms_valid_sciname)
+
+DT::datatable(dupe_iucn)
+
+DT::datatable(dupe_aquax)
+```
