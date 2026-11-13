@@ -1,5 +1,6 @@
 ---
 title: "Global maps of new and lost species in EEZs"
+author: "Laurel Abowd"
 format: 
   html:
     toc: true

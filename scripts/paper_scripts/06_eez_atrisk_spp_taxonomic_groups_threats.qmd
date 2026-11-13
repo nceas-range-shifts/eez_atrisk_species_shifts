@@ -65,11 +65,11 @@ eez_simple_sf <- eez %>%
 # Read in IUCN and AquaX data
 
 ```{r}
-iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/ab9cd09931a4ce5c12d0bcd2984595d6522ed158/_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+iucn_lookup <- read_csv(here("_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv"))
 ```
 
 ```{r}
-iucn_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data/iucn_redlist_2026/iucn_species_assessments.csv")
+iucn_cat <- read_csv(here("_data/iucn_redlist_2026/iucn_species_assessments.csv"))
 ```
 
 ```{r}

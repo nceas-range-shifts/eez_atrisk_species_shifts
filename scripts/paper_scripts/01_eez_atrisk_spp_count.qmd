@@ -1,5 +1,6 @@
 ---
 title: "New and lost species count in EEZs"
+author: "Laurel Abowd"
 format: 
   html:
     toc: true
@@ -24,11 +25,11 @@ This document uses the IUCN lookup and threat category data created in the chi r
 The script then processes the AquaX data to identify the number of at-risk species entering and exiting Exclusive Economic Zones (EEZs) under different climate scenarios.
 
 ```{r}
-iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data_raw/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+iucn_lookup <- read_csv(here("_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv"))
 ```
 
 ```{r}
-iucn_new_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data_raw/iucn_redlist_2026/iucn_species_assessments.csv")
+iucn_cat <- read_csv(here("_data/iucn_redlist_2026/iucn_species_assessments.csv"))
 ```
 
 ```{r}
@@ -85,7 +86,7 @@ iucn_lookup_sdm <- iucn_lookup %>% filter(aquax == "SDM")
 
 ```{r}
 # Filter iucn categories for threatened species (CR, EN, VU) and near threatened (NT) species
-iucn_threatened <- iucn_new_cat %>% 
+iucn_threatened <- iucn_cat %>% 
   filter(redlist_category %in% c("CR","EN", "VU", "NT"))
 ```
 

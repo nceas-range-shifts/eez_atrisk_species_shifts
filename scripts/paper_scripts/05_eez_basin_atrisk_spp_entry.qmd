@@ -1,5 +1,6 @@
 ---
 title: "Baltic, Black Sea, and Sea of Japan maps of new and lost species"
+author: "Laurel Abowd"
 format: 
   html:
     toc: true

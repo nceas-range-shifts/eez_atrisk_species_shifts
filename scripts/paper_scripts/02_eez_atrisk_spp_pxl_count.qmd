@@ -1,5 +1,6 @@
 ---
 title: "Aquax - 1 pxl threshold"
+author: "Laurel Abowd"
 format: 
   html:
     toc: true
@@ -25,11 +26,11 @@ This document uses generates the pixel data used in the paper. First, the script
 This document uses the IUCN lookup and threat category data created in the chi repository. It connects IUCN status to AquaX data using the Aphia ID, which is a unique identifier for marine species in the World Register of Marine Species (WoRMS). 
 
 ```{r}
-iucn_lookup <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/ab9cd09931a4ce5c12d0bcd2984595d6522ed158/_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv")
+iucn_lookup <- read_csv(here("_data/iucn_redlist_2026/iucn_worms_aphia_id_complete.csv"))
 ```
 
 ```{r}
-iucn_new_cat <- read_csv("https://raw.githubusercontent.com/nceas-range-shifts/chi_shifts/refs/heads/main/_data/iucn_redlist_2026/iucn_species_assessments.csv")
+iucn_cat <- read_csv(here("_data/iucn_redlist_2026/iucn_species_assessments.csv"))
 ```
 
 ```{r}
@@ -53,7 +54,7 @@ iucn_lookup_sdm <- iucn_lookup %>% filter(aquax == "SDM")
 
 ```{r}
 # Filter iucn categories for threatened species (CR, EN, VU) and near threatened (NT) species
-iucn_threatened <- iucn_new_cat %>% 
+iucn_threatened <- iucn_cat %>% 
   filter(redlist_category %in% c("CR","EN", "VU", "NT"))
 ```
 
