@@ -1,6 +1,6 @@
 ---
 title: Download IUCN Red List assessments and align to WoRMS
-author: "Casey O'Hara"
+author: "Casey O'Hara & Laurel Abowd"
 format:
   html:
     embed-resources: true
@@ -132,7 +132,14 @@ table(marine_comp_gp_df$group)
 Using `sis_taxon_id` query scientific names.  While we're here, parse red list category and year assessed.  Chunk first checks to see if the final file is complete; if not, loops over each assessment, pinging API only if temp file is not present, then binds all temp files to create the final file.
 
 ```{r}
+library(future)
+library(future.apply)
+```
+
+```{r}
 iucn_spp_assessment_f <- here('_data/iucn_redlist_2026/iucn_species_assessments.csv')
+
+plan(multisession, workers = 75) ### 75 cores on Aurora
 
 if(!file.exists(iucn_spp_assessment_f)) {
   assess_id_vec <- marine_comp_gp_df$assessment_id %>% as.integer()
@@ -188,14 +195,23 @@ if(!file.exists(iucn_spp_assessment_f)) {
   assess_tmp_f_vec <- sprintf(assess_tmp_fstem, assess_id_vec)
   if(any(!file.exists(assess_tmp_f_vec))) stop('Missing one or more tmp files!')
   
+  # did not work on positron; works on rstudio
   # system.time({ ### very slow - reading in 20k files!
-  assess_all_list <- parallel::mclapply(
-    X = assess_tmp_f_vec, 
-    FUN = read_csv, 
-    show_col_types = FALSE,
-    mc.cores = 100)
+  #assess_all_list <- parallel::mclapply(
+    #X = assess_tmp_f_vec, 
+    #FUN = read_csv, 
+    #show_col_types = FALSE,
+    #mc.cores = 100,
+    #mc.cores = 75)
   # })
   
+  # trying future.apply::future_lapply() instead of parallel::mclapply() - to use on positron!
+  assess_all_list <- future_lapply(
+    X = assess_tmp_f_vec, 
+    FUN = read_csv, 
+    show_col_types = FALSE
+  )
+
   ### account for early files not having assessment_id built in:
   assess_all_df <- assess_all_list %>%
     setNames(str_extract(basename(assess_tmp_f_vec), '[0-9]+')) %>%
@@ -214,9 +230,23 @@ assess_all_df <- read_csv(iucn_spp_assessment_f, show_col_types = FALSE)
 # unlink(x)
 ```
 
+```{r}
+plan(sequential) ### reset plan
+```
+
 ### Compare IUCN scinames to WoRMS names
 
 First, compare to the AquaX META which contains ~200k sciname/aphia IDs pairs across various taxa.  This is more comprehensive than the datasets for traits and functional entities, as those focus on animals only.  Though, this does assume that the AquaX version is up to date... but since that's what we're using for SDMs, seems legit.
+
+```{r}
+here_aquax <- function(f = '', ...) {
+  ### create file path to AquaX data dir for project
+  f <- paste(f, ..., sep = '/')
+  f <- stringr::str_replace_all(f, '\\/+', '/')
+  f_anx <- sprintf('/home/shares/data-aquax/%s', f)
+  return(f_anx)
+}
+```
 
 ```{r}
 get_aquax_meta <- function(meta = 'META_02122025.Rdata', sdm = TRUE) {
@@ -435,9 +465,9 @@ Duplicate IUCN scinames may occur when a species name matched directly or fuzzil
 
 Most duplicated WoRMS names occur because of overlap between the synonym fix and Aphia-SIS fix.  These are mostly handled by `distinct()`.
 
-The few remaining duplicates of IUCN scinames indicate species with one SIS ID connected to two Aphia IDs.  In two of these, only one of the Aphia IDs is linked to a SDM so no worries about duplicated maps.  In two other cases, neither Aphia ID is linked to an SDM.  In the case of *Chromis multilineata* --> *Chromis multilineata* and *Azurina multilineata*, both Aphia IDs are linked to SDMs despite *Chromis multilineata* being an unaccepted superseded name.  Check these; are the maps the same?
+The few remaining duplicates of IUCN scinames indicate species with one SIS ID connected to two Aphia IDs.  In two of these, only one of the Aphia IDs is linked to a SDM so no worries about duplicated maps.  In two other cases, neither Aphia ID is linked to an SDM.  In the case of *Chromis multilineata* --> *Chromis multilineata* and *Azurina multilineata*, both Aphia IDs are linked to SDMs despite *Chromis multilineata* being an unaccepted superseded name.  
 
-The few remaining duplicates of WoRMS valid names indicate where IUCN assessments are linked to multiple synonyms of the same species (e.g., *Acanthopagrus datnia* has IUCN assessments under both *Acanthopagrus longispinnis* and *Sparidentex datnia* - one Aphia ID and two SIS IDs.)
+The few remaining duplicates of WoRMS valid names indicate where IUCN assessments are linked to multiple synonyms of the same species (e.g., *Acanthopagrus datnia* has IUCN assessments under both *Acanthopagrus longispinnis* and *Sparidentex datnia* - one Aphia ID and two SIS IDs.) These species are data deficient on the Red List, so not included in the EEZ analysis.
 
 ```{r}
 iucn_aphia_df <- iucn_aphia_match1 %>%
@@ -460,6 +490,7 @@ write_csv(iucn_aphia_df, here('_data/iucn_redlist_2026/iucn_worms_aphia_id_compl
 ```
 
 ```{r}
+# The duplicated species with SDMs are both data deficient on the redlist, so not included in the EEZ analysis
 dupe_iucn <- janitor::get_dupes(iucn_aphia_df, iucn_sciname)
 dupe_aquax <- janitor::get_dupes(iucn_aphia_df, worms_valid_sciname)
 
